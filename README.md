@@ -5,7 +5,7 @@ Takes one or more Altium BOM exports (`.xlsx`) and, for each one, creates
 built entirely from parts that already exist in InvenTree.
 
 **This tool never creates new components.** It only looks up existing
-parts by IPN and links them into a BOM. The only new Part it ever
+parts by name and links them into a BOM. The only new Part it ever
 creates is the Assembly Part representing the project itself.
 
 ## Setup
@@ -39,19 +39,23 @@ and click **Start**.
 
 ## How matching works
 
-- The BOM's **Manufacturer Part Number** column is matched against each
-  InvenTree part's **IPN** field.
+- The BOM's **Comment** column is matched against each InvenTree part's
+  **name** field.
 - The **project name** is the BOM file's name (without the `.xlsx`
   extension) -- it is not read from inside the file.
 - The **Quantity** column becomes the BomItem quantity.
-- The **Value** column (if present) and any unnamed columns (e.g. LCSC
-  codes, free-text notes) are ignored.
+- The **Manufacturer Part Number**, **Value** columns (if present) and
+  any unnamed columns (e.g. LCSC codes, free-text notes) are ignored.
 - Columns are matched by header name, not position, so BOM exports with
   slightly different column layouts are both handled correctly.
+- If a Comment matches more than one part in InvenTree (this happens
+  for placeholder parts that haven't been given a permanent, unique
+  name yet), that line is treated as unmatched -- give the part(s) a
+  unique name in InvenTree, then try again.
 
 ## What happens with unmatched parts
 
-If some BOM lines have no matching IPN in InvenTree, you'll see a table
+If some BOM lines have no matching name in InvenTree, you'll see a table
 listing them before anything is written. You can either continue
 (those lines are left out of the BOM) or cancel that file and go add
 the missing parts to InvenTree first.
@@ -68,7 +72,7 @@ category, you'll be asked whether to:
 
 ## Known limitations / possible next steps
 
-- IPN and category name are assumed to be unique in your InvenTree
+- Part name and category name are assumed to be unique in your InvenTree
   instance -- if they aren't, the tool raises an error rather than
   guessing.
 - Processing runs on the GUI thread. For very large BOMs or many files

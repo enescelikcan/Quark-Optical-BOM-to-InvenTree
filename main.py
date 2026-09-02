@@ -8,8 +8,8 @@ InvenTree with a BOM built from parts already in InvenTree.
 Workflow per file:
     1. Parse the BOM file (bom_parser.parse_bom_file).
     2. Project name = the file's name (without extension).
-    3. For every BOM line, look up an existing InvenTree Part whose IPN
-       matches the line's Manufacturer Part Number.
+    3. For every BOM line, look up an existing InvenTree Part whose name
+       matches the line's Comment.
     4. If any lines have no match, show them to the user and ask whether
        to continue (ignoring the unmatched lines) or cancel this file.
     5. If a project with this name already exists, ask the user whether
@@ -50,6 +50,7 @@ import sys
 import threading
 import traceback
 from datetime import datetime
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 from PyQt6.QtCore import QObject, QThread, pyqtSignal
@@ -72,6 +73,7 @@ from PyQt6.QtWidgets import (
 
 from bom_parser import BomLine, BomParseError, parse_bom_file, project_name_from_file
 from inventree_client import InventreeClient, InventreeConfig
+from stock_report import write_stock_report
 
 CONFIG_PATH = "config.json"
 PROJECT_CATEGORY_NAME = "Projects"
@@ -84,7 +86,7 @@ PROJECT_CATEGORY_NAME = "Projects"
 
 class MissingPartsDialog(QDialog):
     """Shown when one or more BOM lines could not be matched to an
-    existing InvenTree part by IPN. Lets the user continue (those lines
+    existing InvenTree part by name. Lets the user continue (those lines
     will simply be left out of the BOM) or cancel this file entirely."""
 
     def __init__(self, project_name: str, missing_lines: List[BomLine], parent=None):
@@ -96,16 +98,16 @@ class MissingPartsDialog(QDialog):
 
         message = QLabel(
             f"{len(missing_lines)} part(s) in this BOM have no matching "
-            f"IPN in InvenTree. They will be skipped if you continue.\n"
+            f"name in InvenTree. They will be skipped if you continue.\n"
             f"Add them to InvenTree first if they should be included."
         )
         message.setWordWrap(True)
         layout.addWidget(message)
 
         table = QTableWidget(len(missing_lines), 2)
-        table.setHorizontalHeaderLabels(["Manufacturer Part Number", "Quantity"])
+        table.setHorizontalHeaderLabels(["Comment", "Quantity"])
         for row, line in enumerate(missing_lines):
-            table.setItem(row, 0, QTableWidgetItem(line.mpn))
+            table.setItem(row, 0, QTableWidgetItem(line.comment))
             table.setItem(row, 1, QTableWidgetItem(str(line.quantity)))
         table.resizeColumnsToContents()
         layout.addWidget(table)
@@ -200,19 +202,19 @@ class ImportWorker(QObject):
 
         self.log.emit(f"Connected to InvenTree. Using category '{PROJECT_CATEGORY_NAME}'.")
 
-        # Fetch every InvenTree part ONCE and index it by IPN, instead of
+        # Fetch every InvenTree part ONCE and index it by name, instead of
         # doing a separate network request per BOM line. This is the
         # single biggest speedup: an 82-line BOM used to mean 82 round
         # trips just for matching -- now it's one, shared across every
         # file in this run.
-        self.log.emit("Fetching parts from InvenTree for IPN matching...")
-        ipn_index = self.client.build_ipn_index()
-        matched_ipn_count = sum(len(parts) for parts in ipn_index.values())
-        self.log.emit(f"Indexed {matched_ipn_count} part(s) by IPN.\n")
+        self.log.emit("Fetching parts from InvenTree for name matching...")
+        name_index = self.client.build_name_index()
+        matched_name_count = sum(len(parts) for parts in name_index.values())
+        self.log.emit(f"Indexed {matched_name_count} part(s) by name.\n")
 
         for file_path in self.file_paths:
             try:
-                self.process_file(file_path, category, ipn_index)
+                self.process_file(file_path, category, name_index)
             except Exception as exc:
                 self.log.emit(f"[ERROR] Unexpected error processing '{file_path}': {exc}")
                 self.log.emit(traceback.format_exc())
@@ -248,7 +250,7 @@ class ImportWorker(QObject):
     # Per-file processing
     # -----------------------------------------------------------------
 
-    def process_file(self, file_path: str, category, ipn_index: dict) -> None:
+    def process_file(self, file_path: str, category, name_index: dict) -> None:
         project_name = project_name_from_file(file_path)
         self.log.emit(f"=== {project_name} ===")
 
@@ -260,7 +262,7 @@ class ImportWorker(QObject):
 
         self.log.emit(f"Parsed {len(lines)} BOM line(s).")
 
-        matched, missing = self.match_lines(lines, ipn_index)
+        matched, missing = self.match_lines(lines, name_index)
 
         if missing:
             if not self.ask_continue_without_missing_parts(project_name, missing):
@@ -281,7 +283,7 @@ class ImportWorker(QObject):
         imported_count = len(matched) - len(failures)
 
         for (line, part), exc in failures:
-            self.log.emit(f"[ERROR] Failed to add '{line.mpn}': {exc}")
+            self.log.emit(f"[ERROR] Failed to add '{line.comment}': {exc}")
 
         self.log.emit(
             f"Imported {imported_count} BOM item(s) into "
@@ -289,13 +291,13 @@ class ImportWorker(QObject):
         )
 
     def match_lines(
-        self, lines: List[BomLine], ipn_index: dict
+        self, lines: List[BomLine], name_index: dict
     ) -> Tuple[List[Tuple[BomLine, object]], List[BomLine]]:
         matched = []
         missing = []
         for line in lines:
             try:
-                part = self.client.resolve_part_by_ipn(line.mpn, ipn_index)
+                part = self.client.resolve_part_by_name(line.comment, name_index)
             except LookupError as exc:
                 self.log.emit(f"[ERROR] {exc}")
                 missing.append(line)
@@ -371,10 +373,10 @@ class CheckWorker(QObject):
 
         self.log.emit(f"Connected to InvenTree. Using category '{PROJECT_CATEGORY_NAME}'.")
 
-        self.log.emit("Fetching parts from InvenTree for IPN matching...")
-        ipn_index = self.client.build_ipn_index()
-        matched_ipn_count = sum(len(parts) for parts in ipn_index.values())
-        self.log.emit(f"Indexed {matched_ipn_count} part(s) by IPN.")
+        self.log.emit("Fetching parts from InvenTree for name matching...")
+        name_index = self.client.build_name_index()
+        matched_name_count = sum(len(parts) for parts in name_index.values())
+        self.log.emit(f"Indexed {matched_name_count} part(s) by name.")
 
         self.log.emit("Fetching part names for reporting...")
         pk_index = self.client.build_pk_index()
@@ -382,7 +384,7 @@ class CheckWorker(QObject):
 
         for file_path in self.file_paths:
             try:
-                self.check_file(file_path, category, ipn_index, pk_index)
+                self.check_file(file_path, category, name_index, pk_index)
             except Exception as exc:
                 self.log.emit(f"[ERROR] Unexpected error checking '{file_path}': {exc}")
                 self.log.emit(traceback.format_exc())
@@ -391,7 +393,7 @@ class CheckWorker(QObject):
         self.log.emit("Done.")
         self.finished.emit()
 
-    def check_file(self, file_path: str, category, ipn_index: dict, pk_index: dict) -> None:
+    def check_file(self, file_path: str, category, name_index: dict, pk_index: dict) -> None:
         project_name = project_name_from_file(file_path)
         self.log.emit(f"=== {project_name} ===")
 
@@ -413,25 +415,25 @@ class CheckWorker(QObject):
 
         # What the file says (only for lines we can actually match to an
         # InvenTree part -- an unmatched line has no pk to compare with).
-        file_contents: dict = {}   # part_pk -> (mpn, quantity)
+        file_contents: dict = {}   # part_pk -> (comment, quantity)
         unmatched_lines: List[BomLine] = []
         for line in lines:
-            part = self.client.resolve_part_by_ipn(line.mpn, ipn_index)
+            part = self.client.resolve_part_by_name(line.comment, name_index)
             if part is None:
                 unmatched_lines.append(line)
             else:
-                file_contents[part.pk] = (line.mpn, line.quantity)
+                file_contents[part.pk] = (line.comment, line.quantity)
 
         # What InvenTree actually has right now.
         inventree_contents = self.client.get_bom_contents(assembly)  # part_pk -> quantity
 
         missing_in_inventree = []   # in file, not in InvenTree
         quantity_mismatches = []    # in both, different quantity
-        for pk, (mpn, file_qty) in file_contents.items():
+        for pk, (comment, file_qty) in file_contents.items():
             if pk not in inventree_contents:
-                missing_in_inventree.append((mpn, file_qty))
+                missing_in_inventree.append((comment, file_qty))
             elif inventree_contents[pk] != file_qty:
-                quantity_mismatches.append((mpn, file_qty, inventree_contents[pk]))
+                quantity_mismatches.append((comment, file_qty, inventree_contents[pk]))
 
         extra_in_inventree = []     # in InvenTree, not in file
         for pk, qty in inventree_contents.items():
@@ -443,10 +445,10 @@ class CheckWorker(QObject):
         if unmatched_lines:
             self.log.emit(
                 f"[WARNING] {len(unmatched_lines)} BOM line(s) have no "
-                f"matching IPN in InvenTree, skipped from comparison:"
+                f"matching name in InvenTree, skipped from comparison:"
             )
             for line in unmatched_lines:
-                self.log.emit(f"    - {line.mpn} (qty {line.quantity})")
+                self.log.emit(f"    - {line.comment} (qty {line.quantity})")
 
         if not missing_in_inventree and not quantity_mismatches and not extra_in_inventree:
             self.log.emit("MATCH -- InvenTree's BOM matches the file exactly.")
@@ -454,20 +456,109 @@ class CheckWorker(QObject):
 
         if missing_in_inventree:
             self.log.emit(f"In file but missing from InvenTree ({len(missing_in_inventree)}):")
-            for mpn, qty in missing_in_inventree:
-                self.log.emit(f"    - {mpn} (qty {qty})")
+            for comment, qty in missing_in_inventree:
+                self.log.emit(f"    - {comment} (qty {qty})")
 
         if quantity_mismatches:
             self.log.emit(f"Quantity mismatches ({len(quantity_mismatches)}):")
-            for mpn, file_qty, inventree_qty in quantity_mismatches:
+            for comment, file_qty, inventree_qty in quantity_mismatches:
                 self.log.emit(
-                    f"    - {mpn}: file says {file_qty}, InvenTree has {inventree_qty}"
+                    f"    - {comment}: file says {file_qty}, InvenTree has {inventree_qty}"
                 )
 
         if extra_in_inventree:
             self.log.emit(f"In InvenTree but not in file ({len(extra_in_inventree)}):")
             for label, qty in extra_in_inventree:
                 self.log.emit(f"    - {label} (qty {qty})")
+
+
+# =====================================================================
+# Background worker: Stock Report (read-only, writes a new .xlsx file
+# next to the source BOM -- never touches InvenTree or the BOM itself)
+# =====================================================================
+
+
+class StockReportWorker(QObject):
+    """For each selected BOM file, matches every line's Comment against
+    InvenTree by name and writes a stock-availability report (.xlsx)
+    next to the source file, via stock_report.write_stock_report().
+
+    Simpler than CheckWorker: there's no assembly/BOM comparison here,
+    just "for each line in this file, what's InvenTree's current
+    In Stock quantity for that part" -- so this worker doesn't need to
+    look up an Assembly Part at all, only match names and read
+    part.in_stock, which is a field already present on the Part
+    objects returned by build_name_index().
+    """
+
+    log = pyqtSignal(str)
+    finished = pyqtSignal()
+
+    def __init__(self, file_paths: List[str]):
+        super().__init__()
+        self.file_paths = file_paths
+        self.client: Optional[InventreeClient] = None
+
+    def run(self) -> None:
+        try:
+            config = InventreeConfig.load(CONFIG_PATH)
+            self.client = InventreeClient(config)
+        except Exception as exc:
+            self.log.emit(f"[ERROR] Could not connect to InvenTree: {exc}")
+            self.finished.emit()
+            return
+
+        self.log.emit("Connected to InvenTree.")
+        self.log.emit("Fetching parts from InvenTree for name matching...")
+        name_index = self.client.build_name_index()
+        matched_name_count = sum(len(parts) for parts in name_index.values())
+        self.log.emit(f"Indexed {matched_name_count} part(s) by name.")
+        self.log.emit("")
+
+        for file_path in self.file_paths:
+            try:
+                self.export_file(file_path, name_index)
+            except Exception as exc:
+                self.log.emit(f"[ERROR] Unexpected error processing '{file_path}': {exc}")
+                self.log.emit(traceback.format_exc())
+            self.log.emit("")  # blank line between files
+
+        self.log.emit("Done.")
+        self.finished.emit()
+
+    def export_file(self, file_path: str, name_index: dict) -> None:
+        project_name = project_name_from_file(file_path)
+        self.log.emit(f"=== {project_name} ===")
+
+        try:
+            lines = parse_bom_file(file_path)
+        except BomParseError as exc:
+            self.log.emit(f"[ERROR] {exc}")
+            return
+
+        self.log.emit(f"Parsed {len(lines)} BOM line(s).")
+
+        rows: list = []   # (comment, stock or None)
+        unmatched_count = 0
+        for line in lines:
+            try:
+                part = self.client.resolve_part_by_name(line.comment, name_index)
+            except LookupError as exc:
+                self.log.emit(f"[ERROR] {exc}")
+                part = None
+            if part is None:
+                rows.append((line.comment, None))
+                unmatched_count += 1
+            else:
+                rows.append((line.comment, part.in_stock))
+
+        output_path = str(Path(file_path).parent / f"{project_name}_stock_report.xlsx")
+        write_stock_report(output_path, rows)
+
+        self.log.emit(
+            f"Wrote stock report to '{output_path}' "
+            f"({len(rows) - unmatched_count} matched, {unmatched_count} not found)."
+        )
 
 
 # =====================================================================
@@ -478,7 +569,7 @@ class CheckWorker(QObject):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Altium BOM -> InvenTree Importer")
+        self.setWindowTitle("Quark Optical BOM to Inventree")
         self.resize(720, 480)
 
         self.selected_files: List[str] = []
@@ -498,15 +589,24 @@ class MainWindow(QMainWindow):
         layout.addLayout(file_row)
 
         button_row = QHBoxLayout()
-        self.start_button = QPushButton("Start")
+        self.start_button = QPushButton("Load to Inventree")
         self.start_button.clicked.connect(self.start_import)
         self.start_button.setEnabled(False)
-        self.check_button = QPushButton("Check")
+        self.check_button = QPushButton("Check Loaded Project")
         self.check_button.clicked.connect(self.start_check)
         self.check_button.setEnabled(False)
+        self.stock_report_button = QPushButton("Export Stock Report")
+        self.stock_report_button.clicked.connect(self.start_stock_report)
+        self.stock_report_button.setEnabled(False)
         button_row.addWidget(self.start_button)
         button_row.addWidget(self.check_button)
+        button_row.addWidget(self.stock_report_button)
         layout.addLayout(button_row)
+
+        log_row = QHBoxLayout()
+        self.log_row_label = QLabel("Logs:")
+        log_row.addWidget(self.log_row_label)
+        layout.addLayout(log_row)
 
         self.log_view = QTextEdit()
         self.log_view.setReadOnly(True)
@@ -541,18 +641,21 @@ class MainWindow(QMainWindow):
             self.selected_label.setText(f"{len(files)} file(s) selected: {names}")
             self.start_button.setEnabled(True)
             self.check_button.setEnabled(True)
+            self.stock_report_button.setEnabled(True)
 
     # -----------------------------------------------------------------
     # Processing: spin up a worker thread and wire up its signals.
-    # Shared by both Start (ImportWorker) and Check (CheckWorker) --
-    # they differ only in which worker gets created and, for Start,
-    # two extra decision signals that CheckWorker doesn't have because
-    # a read-only comparison never needs to ask the user anything.
+    # Shared by Start (ImportWorker), Check (CheckWorker), and Export
+    # Stock Report (StockReportWorker) -- they differ only in which
+    # worker gets created and, for Start, two extra decision signals
+    # that the other two workers don't have because a read-only
+    # operation never needs to ask the user anything.
     # -----------------------------------------------------------------
 
     def _launch_worker(self, worker: QObject, extra_connections=None) -> None:
         self.start_button.setEnabled(False)
         self.check_button.setEnabled(False)
+        self.stock_report_button.setEnabled(False)
         self.select_button.setEnabled(False)
         self.log_view.clear()
 
@@ -583,9 +686,14 @@ class MainWindow(QMainWindow):
         worker = CheckWorker(self.selected_files)
         self._launch_worker(worker)
 
+    def start_stock_report(self) -> None:
+        worker = StockReportWorker(self.selected_files)
+        self._launch_worker(worker)
+
     def on_processing_finished(self) -> None:
         self.start_button.setEnabled(True)
         self.check_button.setEnabled(True)
+        self.stock_report_button.setEnabled(True)
         self.select_button.setEnabled(True)
 
     # -----------------------------------------------------------------

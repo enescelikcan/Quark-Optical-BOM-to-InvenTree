@@ -5,8 +5,8 @@ Thin wrapper around the official `inventree` Python package
 (https://pypi.org/project/inventree/), exposing only the operations this
 tool needs:
 
-  - look up an existing Part by its IPN field (matched against the BOM's
-    "Manufacturer Part Number" column)
+  - look up an existing Part by its name field (matched against the
+    BOM's "Comment" column)
   - find/create the single "project" Assembly Part inside a given
     category
   - replace or version an Assembly Part's BOM
@@ -103,51 +103,65 @@ class InventreeClient:
         return matches[0]
 
     # ---------------------------------------------------------------
-    # Part lookup by IPN (this is how BOM lines are matched)
+    # Part lookup by name (this is how BOM lines are matched)
     # ---------------------------------------------------------------
     #
-    # Looking up parts one IPN at a time (one network request per BOM
+    # Looking up parts one name at a time (one network request per BOM
     # line) is the main reason imports were slow -- an 82-line BOM meant
     # 82 separate round trips just for matching, before even writing
-    # anything. Instead, we fetch every part ONCE (build_ipn_index) and
-    # do all the matching locally in memory (resolve_part_by_ipn), which
+    # anything. Instead, we fetch every part ONCE (build_name_index) and
+    # do all the matching locally in memory (resolve_part_by_name), which
     # turns "one request per BOM line" into "one request per run".
+    #
+    # This used to match on the IPN field instead (against the BOM's
+    # "Manufacturer Part Number" column). That was switched to name
+    # (against the BOM's "Comment" column) because some IPN values
+    # turned out to be blank or duplicated across otherwise-unrelated
+    # parts, whereas name is unique for every part except
+    # placeholder/not-yet-permanently-named ones -- which we still want
+    # this tool to flag as ambiguous rather than silently guess at (see
+    # resolve_part_by_name() below).
 
-    def build_ipn_index(self) -> dict:
-        """Fetch every Part in InvenTree ONCE, and group them by IPN.
+    def build_name_index(self) -> dict:
+        """Fetch every Part in InvenTree ONCE, and group them by name.
 
-        Returns a dict: IPN -> list of Parts sharing that IPN (almost
+        Returns a dict: name -> list of Parts sharing that name (almost
         always a list of length 1 -- longer lists mean InvenTree has
-        more than one part registered under the same IPN, which
-        resolve_part_by_ipn() will flag as an error when that IPN is
-        actually looked up).
+        more than one part registered under the same name, typically
+        placeholder parts that haven't been given a permanent, unique
+        name yet. resolve_part_by_name() will flag this as an error
+        when that name is actually looked up).
         """
         index: dict = {}
         for part in Part.list(self.api):
-            ipn = getattr(part, "IPN", None)
-            if not ipn:
+            name = getattr(part, "name", None)
+            if not name:
                 continue
-            index.setdefault(ipn, []).append(part)
+            index.setdefault(name, []).append(part)
         return index
 
-    def resolve_part_by_ipn(self, ipn: str, ipn_index: dict) -> Optional[Part]:
-        """Look up a single Part by IPN inside an index built by
-        build_ipn_index() -- no network call, this is a local dict
+    def resolve_part_by_name(self, name: str, name_index: dict) -> Optional[Part]:
+        """Look up a single Part by name inside an index built by
+        build_name_index() -- no network call, this is a local dict
         lookup.
 
-        Returns None if no part has this IPN.
+        Returns None if no part has this name.
 
-        Raises LookupError if more than one Part shares the IPN --
-        InvenTree does not enforce IPN uniqueness by default, so this
-        can genuinely happen and must not be silently guessed at.
+        Raises LookupError if more than one Part shares the name --
+        this happens for placeholder parts that haven't been given a
+        permanent, unique name yet, and must not be silently guessed
+        at (the part needs a unique name in InvenTree before it can be
+        matched reliably).
         """
-        matches = ipn_index.get(ipn, [])
+        matches = name_index.get(name, [])
         if not matches:
             return None
         if len(matches) > 1:
             raise LookupError(
-                f"IPN '{ipn}' matches {len(matches)} different parts in "
-                f"InvenTree. IPN must be unique for this tool to work "
+                f"Name '{name}' matches {len(matches)} different parts "
+                f"in InvenTree (likely a placeholder part that hasn't "
+                f"been given a permanent, unique name yet). Give it a "
+                f"unique name in InvenTree before it can be matched "
                 f"reliably."
             )
         return matches[0]
@@ -323,7 +337,7 @@ class InventreeClient:
         reading the underlying inventree-python library's create()
         method -- it always sends and expects exactly one object per
         request), so this cannot be turned into a single request the
-        way build_ipn_index() was for reads. Instead, it sends several
+        way build_name_index() was for reads. Instead, it sends several
         individual create requests IN PARALLEL using a thread pool (with
         retries -- see _run_with_retries() above for why, and for why
         those retries need to check the server first before repeating a
@@ -382,7 +396,7 @@ class InventreeClient:
         for turning a bare part pk (as stored on a BomItem) back into a
         readable name when reporting check results.
 
-        Kept as a separate fetch from build_ipn_index(), even though
+        Kept as a separate fetch from build_name_index(), even though
         both ultimately read the same Part.list(), so each method stays
         simple and single-purpose and this new read-only feature can't
         accidentally affect the already-tested import path.

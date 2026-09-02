@@ -9,10 +9,19 @@ Design notes:
   BOM exports can have different column layouts (we've seen one export
   with an extra "Value" column that another export doesn't have), so
   relying on column position would silently read the wrong data.
-- Only "Manufacturer Part Number" and "Quantity" are read. Every other
-  column (Comment, Description, Designator, Value, LCSC codes, free-text
-  notes, ...) is ignored -- we only need MPN to match against InvenTree's
-  IPN field, and Quantity for the BomItem quantity.
+- Only "Comment" and "Quantity" are read. Every other column
+  (Description, Designator, Manufacturer Part Number, Value, LCSC codes,
+  free-text notes, ...) is ignored -- we only need Comment to match
+  against InvenTree's part name field, and Quantity for the BomItem
+  quantity.
+
+  Note: this used to match on "Manufacturer Part Number" against
+  InvenTree's IPN field instead. That was switched to Comment/name
+  because some IPN values turned out to be blank or duplicated across
+  parts, while Comment (which corresponds to the part's name in
+  InvenTree) is unique for every part except placeholder/not-yet-named
+  ones -- and those are exactly the ones we want this tool to flag
+  rather than silently guess at.
 - The project name is NOT read from inside the file -- it is the BOM
   file's name (without extension). See project_name_from_file().
 """
@@ -27,14 +36,14 @@ import openpyxl
 # Columns this tool absolutely needs to do its job. If either is missing
 # from a BOM file, we refuse to guess and raise instead.
 REQUIRED_COLUMNS = [
-    "Manufacturer Part Number",
+    "Comment",
     "Quantity",
 ]
 
 
 class BomParseError(Exception):
     """Raised when a BOM file is missing required columns or has bad data
-    in a row (e.g. missing MPN or quantity)."""
+    in a row (e.g. missing Comment or quantity)."""
 
 
 @dataclass
@@ -42,7 +51,7 @@ class BomLine:
     """One row of a parsed BOM, i.e. one unique component used on the
     board, with the total quantity used across all its designators."""
 
-    mpn: str        # Manufacturer Part Number -> matched against InvenTree IPN
+    comment: str    # matched against the InvenTree part's name field
     quantity: int
 
 
@@ -57,7 +66,7 @@ def parse_bom_file(file_path: str) -> List[BomLine]:
     """Read a single Altium BOM export and return one BomLine per row.
 
     Raises BomParseError if required columns are missing, or if a row is
-    missing data we cannot proceed without (MPN or Quantity).
+    missing data we cannot proceed without (Comment or Quantity).
     """
     path = Path(file_path)
     workbook = openpyxl.load_workbook(path, data_only=True)
@@ -78,7 +87,7 @@ def parse_bom_file(file_path: str) -> List[BomLine]:
             f"{', '.join(missing_columns)}"
         )
 
-    mpn_col = header.index("Manufacturer Part Number")
+    comment_col = header.index("Comment")
     quantity_col = header.index("Quantity")
 
     lines: List[BomLine] = []
@@ -89,16 +98,16 @@ def parse_bom_file(file_path: str) -> List[BomLine]:
         if all(cell is None for cell in row):
             continue
 
-        mpn = row[mpn_col]
+        comment = row[comment_col]
         quantity = row[quantity_col]
 
-        if not mpn or quantity is None:
+        if not comment or quantity is None:
             raise BomParseError(
-                f"'{path.name}' row {row_number}: missing Manufacturer "
-                f"Part Number or Quantity -- please fix the BOM file "
-                f"before importing."
+                f"'{path.name}' row {row_number}: missing Comment "
+                f"or Quantity -- please fix the BOM file before "
+                f"importing."
             )
 
-        lines.append(BomLine(mpn=str(mpn).strip(), quantity=int(quantity)))
+        lines.append(BomLine(comment=str(comment).strip(), quantity=int(quantity)))
 
     return lines

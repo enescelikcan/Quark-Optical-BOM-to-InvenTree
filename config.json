@@ -1,5 +1,5 @@
 {
-  "server": "https://demo.inventree.org",
+  "server": "http://10.0.210.7:8000",
   "username": "admin",
-  "password": "inventree"
+  "password": "Password123!"
 }
